@@ -8,6 +8,8 @@ import json
 
 PRESETS_FILE = "presets.json"
 manual_control_enabled = True
+user_interrupted_move = False
+
 # Загрузка .env
 load_dotenv()
 
@@ -96,12 +98,16 @@ def load_preset(camera_index):
         return None
 
 def move_to_preset(preset):
-    global manual_control_enabled
+    global user_interrupted_move
     if not preset:
         print("❌ Пресет не найден.")
         return
 
-    manual_control_enabled = False
+    if current_camera_index == 0:
+        print("⛔ Управление первой камерой запрещено.")
+        return
+
+    user_interrupted_move = False
 
     request = ptz_service.create_type('AbsoluteMove')
     request.ProfileToken = token
@@ -114,28 +120,45 @@ def move_to_preset(preset):
             'x': preset['zoom']
         }
     }
-
-    # 🔥 Максимальная скорость (1.0 = максимум для PanTilt и Zoom)
     request.Speed = {
         'PanTilt': {'x': 1.0, 'y': 1.0},
         'Zoom': {'x': 1.0}
     }
 
     ptz_service.AbsoluteMove(request)
-    print("📍 Переход к пресету на максимальной скорости...")
+    print("📍 Движение к пресету начато (на максимальной скорости)")
 
-    time.sleep(2)
-    manual_control_enabled = True
+    # Цикл ожидания достижения позиции
+    while not user_interrupted_move:
+        status = ptz_service.GetStatus({'ProfileToken': token})
+        current_pan = status.Position.PanTilt.x
+        current_tilt = status.Position.PanTilt.y
+        current_zoom = status.Position.Zoom.x
 
+        if abs(current_pan - preset['pan']) < 0.01 and abs(current_tilt - preset['tilt']) < 0.01 and abs(current_zoom - preset['zoom']) < 0.01:
+            print("✅ Камера достигла пресета")
+            break
 
+        time.sleep(0.1)
 
 def move_camera(pan, tilt, zoom):
+    global user_interrupted_move
+    user_interrupted_move = True
     request = ptz_service.create_type('ContinuousMove')
     request.ProfileToken = token
-    request.Velocity = {
-        'PanTilt': {'x': pan, 'y': tilt},
-        'Zoom': {'x': zoom}
-    }
+
+    # Для первой камеры запрещаем движение (панораму и наклон), но оставляем зум
+    if current_camera_index == 0:
+        request.Velocity = {
+            'PanTilt': {'x': 0, 'y': 0},  # Движение отключено
+            'Zoom': {'x': zoom}  # Зум остаётся
+        }
+    else:
+        request.Velocity = {
+            'PanTilt': {'x': pan, 'y': tilt},  # Для остальных камер — движение
+            'Zoom': {'x': zoom}  # Зум остаётся для всех камер
+        }
+
     ptz_service.ContinuousMove(request)
 
 def stop_camera():
@@ -155,16 +178,15 @@ try:
                 button = event.button
                 print(f"[{joy_id}] Кнопка {button} нажата")
 
-                # Левый Joy-Con: переключение сцен и настройка скорости
                 if joy_id == 0:
                     if button == 0:
-                        ws.call(requests.SetCurrentProgramScene(sceneName=scenes[0]))
+                        ws.call(requests.SetCurrentPreviewScene(sceneName=scenes[0]))
                     elif button == 1:
-                        ws.call(requests.SetCurrentProgramScene(sceneName=scenes[1]))
+                        ws.call(requests.SetCurrentPreviewScene(sceneName=scenes[1]))
                     elif button == 2:
-                        ws.call(requests.SetCurrentProgramScene(sceneName=scenes[2]))
+                        ws.call(requests.SetCurrentPreviewScene(sceneName=scenes[2]))
                     elif button == 3:
-                        ws.call(requests.SetCurrentProgramScene(sceneName=scenes[3]))
+                        ws.call(requests.SetCurrentPreviewScene(sceneName=scenes[3]))
                     elif button == 14:
                         ptz_speed = max(0.1, ptz_speed - 0.1)
                         print(f"🔽 Скорость PTZ уменьшена: {ptz_speed}")
@@ -172,7 +194,6 @@ try:
                         ptz_speed = min(1.0, ptz_speed + 0.1)
                         print(f"🔼 Скорость PTZ увеличена: {ptz_speed}")
 
-                # Правый Joy-Con: переключение камер
                 elif joy_id == 1:
                     if button == 0:
                         current_camera_index = 0
@@ -181,16 +202,21 @@ try:
                         current_camera_index = 1
                         initialize_camera(current_camera_index)
                     elif button == 2:
-                        status = ptz_service.GetStatus({'ProfileToken': token})
-                        pan = status.Position.PanTilt.x
-                        tilt = status.Position.PanTilt.y
-                        zoom = status.Position.Zoom.x
-                        save_preset(current_camera_index, {'pan': pan, 'tilt': tilt, 'zoom': zoom})
+                        if current_camera_index != 0:
+                            status = ptz_service.GetStatus({'ProfileToken': token})
+                            pan = status.Position.PanTilt.x
+                            tilt = status.Position.PanTilt.y
+                            zoom = status.Position.Zoom.x
+                            save_preset(current_camera_index, {'pan': pan, 'tilt': tilt, 'zoom': zoom})
+                        else:
+                            print("⛔ Сохранение пресета для первой камеры отключено.")
                     elif button == 3:
                         preset = load_preset(current_camera_index)
                         move_to_preset(preset)
+                    elif button == 9:
+                        ws.call(requests.TriggerStudioModeTransition())
                     elif button == 14:
-                        zoom_speed = max(0.1, zoom_speed- 0.1)
+                        zoom_speed = max(0.1, zoom_speed - 0.1)
                         print(f"🔽 Скорость Zoom уменьшена: {zoom_speed}")
                     elif button == 15:
                         zoom_speed = min(1.0, zoom_speed + 0.1)
@@ -202,12 +228,11 @@ try:
                 print(f"[{joy_id}] HAT: ({x}, {y})")
 
         if manual_control_enabled:
-            # Управление движением камеры (левый джойкон)
+
             tilt, pan = joysticks[0].get_hat(0)
             pan *= ptz_speed
             tilt *= ptz_speed
 
-            # Управление зумом (правый джойкон)
             zoom_dir, _ = joysticks[1].get_hat(0)
             zoom = zoom_dir * zoom_speed
 
